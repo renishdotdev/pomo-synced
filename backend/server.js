@@ -1,84 +1,71 @@
-require("dotenv").config();
-const express = require("express");
-const mqtt = require("mqtt");
-const fs = require("fs");
+const express = require('express');
+const mqtt = require('mqtt');
 
 const app = express();
-app.use(express.json());
-app.use(require("cors")());
+const PORT = 3000;
 
-const MQTT_BROKER = "mqtt://127.0.0.1:50000";
-const SERVER_PORT = 50009;
-const DATA_FILE = "timers.json";
+// Constants for focus and break durations
+const FOCUS_TIME = 10; // 30 min
+const BREAK_TIME = 10;  // 5 min
 
-// Load existing timers or create an empty file
-let timers = fs.existsSync(DATA_FILE) ? JSON.parse(fs.readFileSync(DATA_FILE)) : {};
+// Connect to MQTT broker
+const mqttClient = mqtt.connect('mqtt://192.168.1.100:1884');
 
-// MQTT Setup
-const mqttClient = mqtt.connect(MQTT_BROKER);
-
-mqttClient.on("connect", () => {
-  console.log("✅ Connected to MQTT broker");
-  mqttClient.subscribe("user/+/timer/control");
+mqttClient.on('connect', () => {
+    console.log('✅ Connected to MQTT broker');
 });
 
-mqttClient.on("message", (topic, message) => {
-  const userID = topic.split("/")[1];
-  const command = message.toString();
-  if (!timers[userID]) return;
+// Timer state stored **in memory** (no DB, no JSON)
+let timer = {
+    timeLeft: FOCUS_TIME,
+    mode: 'focus',
+    running: false
+};
 
-  if (command === "start") startTimer(userID);
-  if (command === "stop") pauseTimer(userID);
-  if (command === "reset") resetTimer(userID);
+// Function to broadcast timer state via MQTT
+function publishTimerState() {
+    mqttClient.publish('user/testUser/timer/state', JSON.stringify(timer));
+}
+
+// Handle MQTT control messages (start/stop/reset/skip)
+mqttClient.on('message', (topic, message) => {
+    if (topic === 'user/testUser/timer/control') {
+        const command = message.toString();
+        if (command === 'start') {
+            timer.running = true;
+        } else if (command === 'stop') {
+            timer.running = false;
+        } else if (command === 'reset') {
+            timer.timeLeft = timer.mode === 'focus' ? FOCUS_TIME : BREAK_TIME;
+        } else if (command === 'skip') {
+            timer.mode = timer.mode === 'focus' ? 'break' : 'focus';
+            timer.timeLeft = timer.mode === 'focus' ? FOCUS_TIME : BREAK_TIME;
+        }
+        publishTimerState();
+    }
 });
 
-// Timer Logic
-function startTimer(userID) {
-  if (timers[userID]?.interval) return; // Already running
+// Subscribe to MQTT control topic
+mqttClient.subscribe('user/testUser/timer/control');
 
-  timers[userID] = {
-    timeLeft: timers[userID]?.timeLeft || 1800,
-    mode: "focus",
-    interval: setInterval(() => {
-      if (--timers[userID].timeLeft <= 0) switchMode(userID);
-      updateTimer(userID);
-    }, 1000),
-  };
-}
+// Timer logic (runs every second if active)
+setInterval(() => {
+    if (timer.running && timer.timeLeft > 0) {
+        timer.timeLeft -= 1;
+        publishTimerState();
+    } else if (timer.timeLeft === 0) {
+        timer.mode = timer.mode === 'focus' ? 'break' : 'focus';
+        timer.timeLeft = timer.mode === 'focus' ? FOCUS_TIME : BREAK_TIME;
+        publishTimerState();
+    }
+}, 1000);
 
-function pauseTimer(userID) {
-  clearInterval(timers[userID]?.interval);
-  timers[userID].interval = null;
-  updateTimer(userID);
-}
-
-function resetTimer(userID) {
-  clearInterval(timers[userID]?.interval);
-  timers[userID] = { timeLeft: 1800, mode: "focus" };
-  updateTimer(userID);
-}
-
-function switchMode(userID) {
-  timers[userID].mode = timers[userID].mode === "focus" ? "break" : "focus";
-  timers[userID].timeLeft = timers[userID].mode === "focus" ? 1800 : 300;
-}
-
-function updateTimer(userID) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(timers, null, 2)); // Save to file
-  mqttClient.publish(`user/${userID}/timer/state`, JSON.stringify(timers[userID]));
-}
-
-// API Routes
-app.get("/timer/:userID", (req, res) => {
-  const { userID } = req.params;
-  res.json(timers[userID] || { timeLeft: 1800, mode: "focus" });
+// API endpoint to check timer state
+app.get('/timer/testUser', (req, res) => {
+    res.json(timer);
 });
 
-app.post("/timer/:userID/:action", (req, res) => {
-  const { userID, action } = req.params;
-  mqttClient.publish(`user/${userID}/timer/control`, action);
-  res.json({ message: `${action} sent` });
+// Start the server
+app.listen(PORT, () => {
+    console.log(`✅ Server running on http://192.168.1.100:${PORT}`);
 });
-
-// Start Server
-app.listen(SERVER_PORT, () => console.log(`✅ Server running on port ${SERVER_PORT}`));
